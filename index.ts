@@ -8,7 +8,7 @@ type LogState = {
 
 type CliOptions = {
   path?: string;
-  litellm: boolean;
+  txt: boolean;
 };
 
 const cliOptions = parseArgs(Bun.argv.slice(2));
@@ -299,16 +299,30 @@ function tryParseValue(input: string): { ok: true; value: unknown } | { ok: fals
   }
 }
 
+function stripAnsiAndControl(input: string): string {
+  const withoutAnsi = input
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, "");
+
+  return withoutAnsi.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
 function parseLine(line: string): unknown {
-  const trimmed = line.trim();
+  const normalized = stripAnsiAndControl(line);
+  const trimmed = normalized.trim();
   if (!trimmed) {
     return "";
+  }
+
+  const curlResult = parseCurlCommand(trimmed);
+  if (curlResult) {
+    return curlResult;
   }
 
   const direct = tryParseValue(trimmed);
   if (direct.ok) {
     if (typeof direct.value === "string" && !trimmed.startsWith("'")) {
-      return { __raw__: line };
+      return { __raw__: normalized };
     }
     return direct.value;
   }
@@ -345,7 +359,7 @@ function parseLine(line: string): unknown {
     return extras;
   }
 
-  return { __raw__: line };
+  return { __raw__: normalized };
 }
 
 function escapeHtml(value: string): string {
@@ -422,8 +436,108 @@ function renderLine(line: string, index: number): string {
   }
 }
 
+function deduplicateLines(lines: string[]): string[] {
+  if (lines.length === 0) return lines;
+  const result: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const current = lines[i];
+    const normalized = stripAnsiAndControl(current).trim();
+    let count = 1;
+    while (
+      i + count < lines.length &&
+      stripAnsiAndControl(lines[i + count]).trim() === normalized
+    ) {
+      count++;
+    }
+    result.push(count > 1 && normalized !== "" ? `${current} (×${count})` : current);
+    i += count;
+  }
+  return result;
+}
+
+function preprocessLines(rawLines: string[]): string[] {
+  const result: string[] = [];
+  let i = 0;
+
+  while (i < rawLines.length) {
+    const line = rawLines[i];
+    if (line.trimEnd().endsWith("\\")) {
+      let joined = line.trimEnd().slice(0, -1);
+      i += 1;
+      while (i < rawLines.length) {
+        const next = rawLines[i];
+        if (next.trimEnd().endsWith("\\")) {
+          joined += " " + next.trim().slice(0, -1);
+          i += 1;
+        } else {
+          joined += " " + next.trim();
+          i += 1;
+          break;
+        }
+      }
+      result.push(joined);
+    } else {
+      result.push(line);
+      i += 1;
+    }
+  }
+
+  return result;
+}
+
+function parseCurlCommand(line: string): Record<string, unknown> | null {
+  const curlMatch = line.match(/^curl\s+/);
+  if (!curlMatch) {
+    return null;
+  }
+
+  const result: Record<string, unknown> = { __type__: "curl" };
+
+  const methodMatch = line.match(/-X\s+(\w+)/);
+  if (methodMatch) {
+    result.method = methodMatch[1];
+  }
+
+  const urlMatch = line.match(/(?:^curl\s+|-X\s+\w+\s+)(https?:\/\/\S+)/);
+  if (urlMatch) {
+    result.url = urlMatch[1];
+  }
+
+  const dataIndex = line.search(/\s-d\s/);
+  const headerPart = dataIndex !== -1 ? line.slice(0, dataIndex) : line;
+
+  const headers: Record<string, string> = {};
+  const headerRegex = /-H\s+'([^']+)'/g;
+  let hMatch;
+  while ((hMatch = headerRegex.exec(headerPart)) !== null) {
+    const colonIndex = hMatch[1].indexOf(":");
+    if (colonIndex !== -1) {
+      const key = hMatch[1].slice(0, colonIndex).trim();
+      const val = hMatch[1].slice(colonIndex + 1).trim();
+      headers[key] = val;
+    }
+  }
+  if (Object.keys(headers).length > 0) {
+    result.headers = headers;
+  }
+
+  if (dataIndex !== -1) {
+    const dataPart = line.slice(dataIndex);
+    const dataMatch = dataPart.match(/-d\s+'([\s\S]+)'\s*$/);
+    if (dataMatch) {
+      const bodyStr = dataMatch[1];
+      const parsed = tryParseValue(bodyStr);
+      result.body = parsed.ok ? parsed.value : bodyStr;
+    }
+  }
+
+  return result;
+}
+
 function renderReport(logText: string, state: LogState): string {
-  const lines = logText.split(/\r?\n/);
+  const rawLines = logText.split(/\r?\n/);
+  const lines = deduplicateLines(preprocessLines(rawLines));
   const rendered = lines
     .map((line, index) => renderLine(line, index + 1))
     .join("");
@@ -555,6 +669,20 @@ function renderReport(logText: string, state: LogState): string {
   </html>`;
 }
 
+if (cliOptions.txt) {
+  const rawLines = logState.text.split(/\r?\n/);
+  const lines = deduplicateLines(preprocessLines(rawLines));
+  for (const [i, line] of lines.entries()) {
+    try {
+      const parsed = parseLine(line);
+      console.log(`${i + 1}: ${JSON.stringify(parsed)}`);
+    } catch (e) {
+      console.log(`${i + 1}: [ERROR] ${e}`);
+    }
+  }
+  process.exit(0);
+}
+
 app.get("/", (c) => c.html(renderReport(logState.text, logState)));
 
 app.get("/health", (c) => c.text("ok"));
@@ -580,14 +708,6 @@ async function loadLogFromFile(options: CliOptions): Promise<LogState> {
   }
 
   const text = await file.text();
-  if (options.litellm) {
-    const normalized = normalizeLiteLLMText(text);
-    return {
-      text: normalized.text,
-      status: `Loaded ${normalized.lineCount} LiteLLM message lines from ${options.path}`,
-      path: options.path,
-    };
-  }
   return {
     text,
     status: `Loaded ${text.split(/\r?\n/).length} lines from ${options.path}`,
@@ -597,11 +717,11 @@ async function loadLogFromFile(options: CliOptions): Promise<LogState> {
 
 function parseArgs(args: string[]): CliOptions {
   let path: string | undefined;
-  let litellm = false;
+  let txt = false;
 
   for (const arg of args) {
-    if (arg.toLowerCase() === "--litellm") {
-      litellm = true;
+    if (arg.toLowerCase() === "--txt") {
+      txt = true;
       continue;
     }
     if (!path) {
@@ -609,244 +729,5 @@ function parseArgs(args: string[]): CliOptions {
     }
   }
 
-  return { path, litellm };
-}
-
-function normalizeLiteLLMText(text: string): { text: string; lineCount: number } {
-  const lines = text.split(/\r?\n/);
-  const state: LiteLLMState = {
-    promptByRole: new Map(),
-    promptMessages: [],
-    promptExtras: new Set(),
-    responseContent: "",
-    responseReasoning: "",
-    responseText: "",
-    model: "",
-  };
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed === "Raw OpenAI Chunk") {
-      continue;
-    }
-
-    const candidates = extractLiteLLMCandidates(line);
-    for (const candidate of candidates) {
-      collectLiteLLMData(candidate, state);
-    }
-  }
-
-  const output: string[] = [];
-  if (state.model) {
-    output.push(`model: ${state.model}`);
-  }
-
-  for (const [role, content] of state.promptByRole.entries()) {
-    if (content.trim()) {
-      output.push(`prompt.${role}: ${content.trim()}`);
-    }
-  }
-
-  if (state.promptMessages.length > 0) {
-    const combined = state.promptMessages
-      .map((message) => `${message.role}: ${message.content}`)
-      .join(" | ");
-    output.push(`prompt.sequence: ${combined}`);
-  }
-
-  for (const extra of state.promptExtras.values()) {
-    output.push(`prompt.raw: ${extra}`);
-  }
-
-  if (state.responseReasoning.trim()) {
-    output.push(`response.reasoning: ${state.responseReasoning.trim()}`);
-  }
-  if (state.responseContent.trim()) {
-    output.push(`response.content: ${state.responseContent.trim()}`);
-  }
-  if (state.responseText.trim()) {
-    output.push(`response.text: ${state.responseText.trim()}`);
-  }
-
-  return { text: output.join("\n"), lineCount: output.length };
-}
-
-type LiteLLMState = {
-  promptByRole: Map<string, string>;
-  promptMessages: PromptMessage[];
-  promptExtras: Set<string>;
-  responseContent: string;
-  responseReasoning: string;
-  responseText: string;
-  model: string;
-};
-
-type PromptMessage = {
-  role: string;
-  content: string;
-};
-
-function extractLiteLLMCandidates(line: string): unknown[] {
-  const parsed = parseLine(line);
-  const candidates: unknown[] = [];
-
-  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-    if (!("__raw__" in parsed)) {
-      candidates.push(parsed);
-    }
-  }
-
-  const parts = line.split(";").map((part) => part.trim()).filter(Boolean);
-  for (const part of parts) {
-    const match = part.match(/^[^:=]+\s*(=|:)\s*(.+)$/);
-    if (match) {
-      const parsedValue = tryParseValue(match[2].trim());
-      if (parsedValue.ok) {
-        candidates.push(parsedValue.value);
-      }
-    }
-  }
-
-  return candidates;
-}
-
-function collectLiteLLMData(value: unknown, state: LiteLLMState): void {
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      collectLiteLLMData(item, state);
-    }
-    return;
-  }
-
-  if (!value || typeof value !== "object") {
-    return;
-  }
-
-  const record = value as Record<string, unknown>;
-  if (typeof record.model === "string" && !state.model) {
-    state.model = record.model;
-  }
-
-  if (Array.isArray(record.messages)) {
-    for (const message of record.messages) {
-      collectPromptMessage(message, state);
-    }
-  }
-
-  for (const [key, entry] of Object.entries(record)) {
-    if (key === "messages") {
-      continue;
-    }
-
-    if (key === "prompt" || key === "input" || key === "user_prompt" || key === "system_prompt") {
-      if (typeof entry === "string" && entry.trim()) {
-        state.promptExtras.add(entry.trim());
-      }
-      continue;
-    }
-
-    if (key === "content" || key === "text" || key === "reasoning" || key === "reasoning_content") {
-      if (typeof entry === "string") {
-        const trimmed = entry.trim();
-        if (!trimmed) {
-          continue;
-        }
-        if (key === "content") {
-          state.responseContent = mergeChunk(state.responseContent, trimmed);
-        } else if (key === "reasoning" || key === "reasoning_content") {
-          state.responseReasoning = mergeChunk(state.responseReasoning, trimmed);
-        } else {
-          state.responseText = mergeChunk(state.responseText, trimmed);
-        }
-      }
-    }
-
-    collectLiteLLMData(entry, state);
-  }
-}
-
-function collectPromptMessage(message: unknown, state: LiteLLMState): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-
-  const record = message as Record<string, unknown>;
-  const role = typeof record.role === "string" ? record.role : "message";
-  const content = extractMessageContent(record.content);
-  if (content.trim()) {
-    const existing = state.promptByRole.get(role) ?? "";
-    state.promptByRole.set(role, mergeChunk(existing, content.trim()));
-    appendPromptSequence(state, role, content.trim());
-  }
-}
-
-function appendPromptSequence(state: LiteLLMState, role: string, content: string): void {
-  const current = state.promptMessages[state.promptMessages.length - 1];
-  if (current && current.role === role) {
-    current.content = mergeChunk(current.content, content);
-    return;
-  }
-
-  state.promptMessages.push({ role, content });
-}
-
-function extractMessageContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
-
-  if (Array.isArray(content)) {
-    return content.map((item) => extractMessageContent(item)).join("");
-  }
-
-  if (content && typeof content === "object") {
-    const record = content as Record<string, unknown>;
-    if (typeof record.text === "string") {
-      return record.text;
-    }
-    if (typeof record.content === "string") {
-      return record.content;
-    }
-    if (typeof record.value === "string") {
-      return record.value;
-    }
-  }
-
-  return "";
-}
-
-function mergeChunk(existing: string, chunk: string): string {
-  const current = existing ?? "";
-  if (!current) {
-    return chunk;
-  }
-  if (current.includes(chunk)) {
-    return current;
-  }
-  if (chunk.includes(current)) {
-    return chunk;
-  }
-
-  const overlap = findOverlap(current, chunk);
-  if (overlap > 0) {
-    return current + chunk.slice(overlap);
-  }
-
-  const needsSpace =
-    current.length > 0 &&
-    chunk.length > 0 &&
-    !/\s$/.test(current) &&
-    !/^\s/.test(chunk);
-
-  return needsSpace ? `${current} ${chunk}` : current + chunk;
-}
-
-function findOverlap(left: string, right: string): number {
-  const max = Math.min(left.length, right.length);
-  for (let size = max; size > 0; size -= 1) {
-    if (left.slice(-size) === right.slice(0, size)) {
-      return size;
-    }
-  }
-  return 0;
+  return { path, txt };
 }

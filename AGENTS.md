@@ -2,9 +2,7 @@ Project commands (Bun)
 
 - Install: `bun install`
 - Run dev server: `bun run dev -- path\to\log.txt`
-- Run dev server (LiteLLM mode): `bun run dev -- path\to\log.txt --litellm`
 - Run server (prod): `bun run start -- path\to\log.txt`
-- Run server (prod, LiteLLM mode): `bun run start -- path\to\log.txt --litellm`
 
 Notes
 
