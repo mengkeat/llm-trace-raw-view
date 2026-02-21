@@ -399,58 +399,50 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function renderValue(value: unknown, depth: number): string {
-  if (value === null) {
-    return `<span class="literal null">null</span>`;
-  }
+function renderFormattedValue(value: unknown, indent: number): string {
+  const pad = "  ".repeat(indent);
+  const padInner = "  ".repeat(indent + 1);
 
+  if (value === null) return '<span class="literal null">null</span>';
+  if (typeof value === "boolean") return `<span class="literal">${value}</span>`;
+  if (typeof value === "number") return `<span class="literal">${value}</span>`;
   if (typeof value === "string") {
-    const html = escapeHtml(value).replace(/\n/g, "<br>");
-    return `<span class="string">${html}</span>`;
-  }
-
-  if (typeof value === "number" || typeof value === "boolean") {
-    return `<span class="literal">${value}</span>`;
+    const escaped = escapeHtml(JSON.stringify(value));
+    return `<span class="string">${escaped}</span>`;
   }
 
   if (Array.isArray(value)) {
-    const open = depth <= 1 ? " open" : "";
-    const items = value
-      .map((item, index) =>
-        `<div class="entry"><span class="key">${index}</span>${renderValue(item, depth + 1)}</div>`
-      )
-      .join("");
-    return `
-      <details class="node"${open}>
-        <summary>Array(${value.length})</summary>
-        <div class="children">${items}</div>
-      </details>
-    `;
+    if (value.length === 0) return "[]";
+    const items = value.map(
+      (item) => `${padInner}${renderFormattedValue(item, indent + 1)}`
+    );
+    return `[\n${items.join(",\n")}\n${pad}]`;
   }
 
   if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    if (typeof record.__raw__ === "string") {
-      return `<span class="raw">${escapeHtml(record.__raw__)}</span>`;
-    }
-    const entries = Object.entries(record).filter(([key]) => key !== "__type__");
-    const typeLabel = typeof record.__type__ === "string" ? record.__type__ : "Object";
-    const open = depth === 0 ? " open" : "";
-    const children = entries
-      .map(([key, val]) =>
-        `<div class="entry"><span class="key">${escapeHtml(key)}</span>${renderValue(val, depth + 1)}</div>`
-      )
-      .join("");
-
-    return `
-      <details class="node"${open}>
-        <summary>${escapeHtml(typeLabel)}${entries.length === 0 ? " {}" : ""}</summary>
-        <div class="children">${children}</div>
-      </details>
-    `;
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) return "{}";
+    const items = entries.map(
+      ([key, val]) =>
+        `${padInner}<span class="key">${escapeHtml(JSON.stringify(key))}</span>: ${renderFormattedValue(val, indent + 1)}`
+    );
+    return `{\n${items.join(",\n")}\n${pad}}`;
   }
 
-  return `<span class="literal">${escapeHtml(String(value))}</span>`;
+  return escapeHtml(String(value));
+}
+
+function renderValue(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return renderFormattedValue(value, 0);
+  }
+
+  const record = value as Record<string, unknown>;
+  if (typeof record.__raw__ === "string") {
+    return `<span class="raw">${escapeHtml(record.__raw__)}</span>`;
+  }
+
+  return `<pre class="json-block">${renderFormattedValue(value, 0)}</pre>`;
 }
 
 function renderLine(line: string, index: number): string {
@@ -459,7 +451,7 @@ function renderLine(line: string, index: number): string {
     if (parsed === "") {
       return `<div class="line"><span class="line-no">${index}</span><span class="empty">(empty)</span></div>`;
     }
-    return `<div class="line"><span class="line-no">${index}</span>${renderValue(parsed, 0)}</div>`;
+    return `<div class="line"><span class="line-no">${index}</span>${renderValue(parsed)}</div>`;
   } catch {
     return `<div class="line"><span class="line-no">${index}</span><span class="raw">${escapeHtml(line)}</span></div>`;
   }
@@ -666,21 +658,11 @@ function renderReport(logText: string, state: LogState): string {
           font-style: italic;
         }
 
-        details.node > summary {
-          cursor: pointer;
-          color: var(--accent);
-        }
-
-        .children {
-          padding: 6px 0 4px 16px;
-          display: grid;
-          gap: 4px;
-        }
-
-        .entry {
-          display: flex;
-          gap: 8px;
-          align-items: flex-start;
+        .json-block {
+          margin: 0;
+          white-space: pre-wrap;
+          word-break: break-word;
+          line-height: 1.5;
         }
       </style>
     </head>
