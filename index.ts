@@ -30,12 +30,23 @@ class ParseError extends Error {
   }
 }
 
-const stringEscapes: Record<string, string> = {
+const singleStringEscapes: Record<string, string> = {
   "n": "\n",
   "r": "\r",
   "t": "\t",
   "\\": "\\",
   "'": "'",
+};
+
+const doubleStringEscapes: Record<string, string> = {
+  "n": "\n",
+  "r": "\r",
+  "t": "\t",
+  "\\": "\\",
+  '"': '"',
+  "/": "/",
+  "b": "\b",
+  "f": "\f",
 };
 
 function tokenize(input: string): Token[] {
@@ -50,20 +61,30 @@ function tokenize(input: string): Token[] {
       continue;
     }
 
-    if (char === "'") {
+    if (char === "'" || char === '"') {
+      const quote = char;
+      const escapes = quote === '"' ? doubleStringEscapes : singleStringEscapes;
       let value = "";
       index += 1;
       while (index < input.length) {
         const current = input[index];
         if (current === "\\") {
           const next = input[index + 1];
-          if (next && stringEscapes[next]) {
-            value += stringEscapes[next];
+          if (quote === '"' && next === "u") {
+            const hex = input.slice(index + 2, index + 6);
+            if (hex.length === 4 && /^[0-9a-fA-F]{4}$/.test(hex)) {
+              value += String.fromCharCode(parseInt(hex, 16));
+              index += 6;
+              continue;
+            }
+          }
+          if (next && escapes[next]) {
+            value += escapes[next];
             index += 2;
             continue;
           }
         }
-        if (current === "'") {
+        if (current === quote) {
           index += 1;
           break;
         }
@@ -130,15 +151,15 @@ class Parser {
     }
 
     if (token.type === "identifier") {
-      if (token.value === "None") {
+      if (token.value === "None" || token.value === "null") {
         this.index += 1;
         return null;
       }
-      if (token.value === "True") {
+      if (token.value === "True" || token.value === "true") {
         this.index += 1;
         return true;
       }
-      if (token.value === "False") {
+      if (token.value === "False" || token.value === "false") {
         this.index += 1;
         return false;
       }
@@ -319,9 +340,16 @@ function parseLine(line: string): unknown {
     return curlResult;
   }
 
+  try {
+    const jsonValue = JSON.parse(trimmed);
+    if (jsonValue !== null && typeof jsonValue === "object") {
+      return jsonValue;
+    }
+  } catch {}
+
   const direct = tryParseValue(trimmed);
   if (direct.ok) {
-    if (typeof direct.value === "string" && !trimmed.startsWith("'")) {
+    if (typeof direct.value === "string" && !trimmed.startsWith("'") && !trimmed.startsWith('"')) {
       return { __raw__: normalized };
     }
     return direct.value;
@@ -377,7 +405,8 @@ function renderValue(value: unknown, depth: number): string {
   }
 
   if (typeof value === "string") {
-    return `<span class="string">'${escapeHtml(value)}'</span>`;
+    const html = escapeHtml(value).replace(/\n/g, "<br>");
+    return `<span class="string">${html}</span>`;
   }
 
   if (typeof value === "number" || typeof value === "boolean") {
